@@ -112,7 +112,7 @@ class Settings:
     @property
     def GROQ_MODEL(self) -> str:
         """Groq model name for the Lock module."""
-        return os.environ.get("GROQ_MODEL", "llama-3.2-11b-vision-preview")
+        return os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
     @property
     def LOG_LEVEL(self) -> str:

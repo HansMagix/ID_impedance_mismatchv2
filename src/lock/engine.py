@@ -118,11 +118,11 @@ def _log_retry(retry_state: RetryCallState) -> None:
 class LockConfig:
     """Immutable configuration for the GrammarLock.
 
-    Sensible defaults target Groq's Llama 3.2 Vision with
+    Sensible defaults target Groq's Llama 4 Scout with
     deterministic output (``temperature=0``).
     """
 
-    model_name: str = "llama-3.2-11b-vision-preview"
+    model_name: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     temperature: float = 0.0
     max_output_tokens: int = 8_192
     max_api_retries: int = 3
