@@ -1,28 +1,25 @@
 """
-GCAW Scout Engine — Async Perception Layer
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GCAW Scout Engine — Async Perception Layer (Visual AI)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Playwright-based browser automation that:
   1. Navigates to a target URL with anti-bot stealth measures.
   2. Forces lazy-loaded content into the DOM via progressive scrolling.
-  3. Detects the primary data region (ROI) using a scored heuristic.
-  4. Captures a pixel-perfect screenshot of *only* the ROI element.
+  3. Detects the primary data region (ROI) using **Groq Vision AI**
+     (Llama 4 Scout) instead of brittle CSS-heuristics.
+  4. Captures a pixel-perfect screenshot of *only* the ROI region.
 
 Design Decisions:
-  - **No `networkidle`**: Playwright's `networkidle` is fundamentally flaky
-    on dynamic industrial dashboards. We use `domcontentloaded` + explicit
-    selector waits, which is deterministic and fast.
-  - **Lazy-Load Strategy**: Incremental smooth-scroll in viewport-sized steps.
-    We track `document.body.scrollHeight`; if it stabilizes for N consecutive
-    scrolls, we declare the page fully loaded. A hard cap prevents infinite
-    scroll traps (e.g., social media feeds).
-  - **ROI Heuristic**: We score every `<table>`, `[role="grid"]`, and grid-
-    classed `<div>` by `visible_area × log(data_density + 1)`. This naturally
-    ranks large, data-dense tables above tiny nav-bars or footer links.
-    Candidates below 10,000 px² or with fewer than 2×2 cells are excluded.
-  - **Anti-Bot**: User-Agent rotation from a curated pool, Chromium stealth
-    launch args (disable automation flags), and navigator property masking
-    via `addInitScript`.
+  - **Visual ROI Detection**: A full-page screenshot is sent to Groq's
+    Vision model, which returns a ``[ymin, xmin, ymax, xmax]`` bounding
+    box for the main data region.  This replaces the old density-scoring
+    heuristic, making detection layout-agnostic (works on ``<table>``,
+    CSS Grid, product cards, dashboards — anything visual).
+  - **Graceful Fallback**: If the Vision call fails (API error, invalid
+    JSON, out-of-bounds bbox), the Scout falls back to a full-viewport
+    crop so the pipeline never halts.
+  - **No ``networkidle``**: Uses ``domcontentloaded`` + explicit waits.
+  - **Anti-Bot**: UA rotation, Chromium stealth args, navigator masking.
 
 :copyright: 2026 GCAW Project
 :license: MIT
@@ -31,20 +28,24 @@ Design Decisions:
 from __future__ import annotations
 
 import asyncio
-import math
+import base64
+import json
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from groq import Groq
 from loguru import logger
 from playwright.async_api import (
     Browser,
     BrowserContext,
-    ElementHandle,
     Page,
     Playwright,
     async_playwright,
 )
+
+from src.domain.trace import Trace
 
 # ────────────────────────────────────────────────────────────────────
 # Constants
@@ -99,18 +100,16 @@ _STEALTH_ARGS: list[str] = [
     "--disable-background-timer-throttling",
 ]
 
-_TABLE_SELECTORS: str = (
-    "table, "
-    "[role='grid'], [role='table'], "
-    "[class*='data-table'], [class*='datatable'], "
-    "[class*='DataTable'], [class*='grid-table'], "
-    "[class*='ag-body'], [class*='el-table'], "
-    "[class*='ant-table'], [class*='MuiTable']"
+_VISION_PROMPT: str = (
+    "You are a bounding-box detector for data tables. "
+    "Analyse this webpage screenshot and find the MAIN data table, "
+    "data grid, or product listing — the primary content region. "
+    "Ignore navigation bars, headers, footers, sidebars, and ads. "
+    "Return ONLY a JSON array of 4 integers: [ymin, xmin, ymax, xmax] "
+    "representing the pixel coordinates of the bounding box. "
+    "Example: [120, 50, 800, 1400]. "
+    "NO explanation, NO markdown, ONLY the JSON array."
 )
-
-_MIN_ROI_AREA_PX: int = 10_000
-_MIN_ROI_ROWS: int = 2
-_MIN_ROI_COLS: int = 2
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -139,7 +138,10 @@ class ScoutConfig:
 
     # Timeouts
     page_load_timeout_ms: int = 30_000
-    roi_wait_timeout_ms: int = 5_000
+
+    # Groq Vision (for ROI detection)
+    groq_api_key: str = ""
+    vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     @property
     def viewport(self) -> dict[str, int]:
@@ -154,7 +156,7 @@ class ScoutConfig:
 class ScoutError(Exception):
     """Raised for any unrecoverable failure in the Scout layer.
 
-    Wraps underlying Playwright / selector / timeout errors with a
+    Wraps underlying Playwright / Vision / timeout errors with a
     domain-meaningful message so callers never need to catch infra
     exceptions directly.
     """
@@ -184,7 +186,7 @@ class AsyncScout:
 
     Or use the async-context-manager shorthand::
 
-        async with AsyncScout.create(headless=True) as scout:
+        async with AsyncScout(config=cfg) as scout:
             result = await scout.capture(url)
     """
 
@@ -200,11 +202,24 @@ class AsyncScout:
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
 
+        # Initialise Groq client for Vision ROI detection
+        if self._config.groq_api_key:
+            self._groq: Groq | None = Groq(
+                api_key=self._config.groq_api_key
+            )
+        else:
+            self._groq = None
+            logger.warning(
+                "Scout: No GROQ_API_KEY — Vision ROI disabled, "
+                "will use full-viewport fallback."
+            )
+
     @classmethod
     async def create(cls, **kwargs: Any) -> "AsyncScout":
         """Factory that eagerly initialises the browser.
 
-        Returns the instance — also usable as ``async with AsyncScout.create() as s:``.
+        Returns the instance — also usable as
+        ``async with AsyncScout.create() as s:``.
         """
         instance = cls(**kwargs)
         await instance._ensure_browser()
@@ -280,7 +295,7 @@ class AsyncScout:
     # ── Public API ──────────────────────────────────────────────────
 
     async def capture(self, url: str) -> dict[str, Any]:
-        """Scout a URL and return a targeted screenshot of the primary table.
+        """Scout a URL and return a targeted screenshot of the data region.
 
         Parameters
         ----------
@@ -290,19 +305,19 @@ class AsyncScout:
         Returns
         -------
         dict
-            ``screenshot_bytes``  — PNG bytes of the ROI element.
-            ``roi_metadata``      — dict with ``tag``, ``bounding_box``,
-            ``row_count``, ``col_count``, ``data_density``, ``score``,
-            ``selector``.
+            ``screenshot_bytes`` — PNG bytes of the ROI crop.
+            ``roi_metadata``     — dict with ``bounding_box``,
+            ``detection_method``, ``vision_confidence``.
+            ``trace``            — ``Trace`` dataclass with timing info.
 
         Raises
         ------
         ScoutError
-            If navigation fails, no data table is found, or an
-            unexpected runtime error occurs.
+            If navigation fails or an unexpected runtime error occurs.
         """
         logger.info("── Scout: capture({}) ──", url)
         ctx: BrowserContext | None = None
+        t_start: float = time.perf_counter()
 
         try:
             ctx = await self._new_stealth_context()
@@ -327,24 +342,60 @@ class AsyncScout:
             # ── Lazy-load ──────────────────────────────────────────
             await self._force_lazy_load(page)
 
-            # ── ROI detection ──────────────────────────────────────
-            roi_handle, roi_meta = await self._detect_roi(page)
+            # ── Full-page screenshot for Vision ────────────────────
+            full_screenshot: bytes = await page.screenshot(
+                type="png", full_page=True
+            )
+            logger.debug(
+                "Full-page screenshot: {} bytes.", len(full_screenshot)
+            )
 
-            # ── Screenshot of ROI only ─────────────────────────────
-            screenshot_bytes: bytes = await roi_handle.screenshot(type="png")
+            # ── Vision ROI detection ───────────────────────────────
+            bbox, detection_method, vision_confidence = (
+                self._get_visual_bbox(full_screenshot)
+            )
+
+            # ── Crop to ROI ────────────────────────────────────────
+            if detection_method == "vision":
+                roi_screenshot: bytes = await page.screenshot(
+                    type="png",
+                    clip={
+                        "x": bbox["x"],
+                        "y": bbox["y"],
+                        "width": bbox["width"],
+                        "height": bbox["height"],
+                    },
+                )
+            else:
+                # Fallback: use the full-page screenshot as-is
+                roi_screenshot = full_screenshot
+
+            # ── Build metadata ─────────────────────────────────────
+            scout_latency_ms = (time.perf_counter() - t_start) * 1000
+            roi_meta: dict[str, Any] = {
+                "bounding_box": bbox,
+                "detection_method": detection_method,
+                "vision_confidence": vision_confidence,
+            }
+            trace = Trace(
+                scout_latency_ms=round(scout_latency_ms, 1),
+                detection_method=detection_method,
+                vision_confidence=vision_confidence,
+            )
+
             logger.success(
-                "Captured ROI <{tag}> — {w}×{h} px, "
-                "{rows}r × {cols}c, score={score:.0f}.",
-                tag=roi_meta["tag"],
-                w=roi_meta["bounding_box"]["width"],
-                h=roi_meta["bounding_box"]["height"],
-                rows=roi_meta["row_count"],
-                cols=roi_meta["col_count"],
-                score=roi_meta["score"],
+                "Captured ROI — {}×{} px, method={}, "
+                "confidence={}, latency={:.0f}ms.",
+                bbox["width"],
+                bbox["height"],
+                detection_method,
+                vision_confidence,
+                scout_latency_ms,
             )
             return {
-                "screenshot_bytes": screenshot_bytes,
+                "screenshot_bytes": roi_screenshot,
                 "roi_metadata": roi_meta,
+                "trace": trace,
             }
 
         except ScoutError:
@@ -414,187 +465,120 @@ class AsyncScout:
         await page.evaluate("window.scrollTo({ top: 0, behavior: 'smooth' })")
         await asyncio.sleep(0.3)
 
-    # ── ROI Detection ───────────────────────────────────────────────
+    # ── Vision ROI Detection ────────────────────────────────────────
 
-    async def _detect_roi(
-        self, page: Page
-    ) -> tuple[ElementHandle, dict[str, Any]]:
-        """Identify the primary data table on the page.
+    def _get_visual_bbox(
+        self, screenshot_bytes: bytes
+    ) -> tuple[dict[str, int], str, float | None]:
+        """Use Groq Vision to detect the data region bounding box.
 
-        **Heuristic — Scored Ranking:**
-
-        For every candidate element matching ``_TABLE_SELECTORS``:
-
-        * Compute **visible area** = ``width × height`` from bounding box.
-        * Compute **data density** = ``row_count × col_count``.
-        * **Score** = ``area × log(density + 1)``.
-
-        The logarithm prevents a huge-but-empty ``<div>`` from winning
-        over a moderately-sized table packed with cells.
-
-        Candidates are filtered out if:
-        * Bounding box area < 10 000 px²  (nav bars, icon grids).
-        * Fewer than 2 rows or 2 columns  (single-cell wrappers).
+        Parameters
+        ----------
+        screenshot_bytes : bytes
+            Full-page PNG screenshot.
 
         Returns
         -------
-        tuple[ElementHandle, dict]
-            The winning element handle and its metadata dict.
-
-        Raises
-        ------
-        ScoutError
-            If no qualifying element is found.
+        tuple[dict, str, float | None]
+            - Bounding box dict: ``{"x", "y", "width", "height"}``
+            - Detection method: ``"vision"`` or ``"fallback"``
+            - Vision confidence (placeholder, currently ``None``
+              for fallback)
         """
-        logger.debug("ROI: scanning for candidates …")
+        if self._groq is None:
+            logger.info("Vision ROI: no Groq client, using fallback.")
+            return self._fallback_bbox(screenshot_bytes), "fallback", None
 
-        # Wait briefly for at least one table-like element
         try:
-            await page.wait_for_selector(
-                "table, [role='grid'], [role='table']",
-                timeout=self._config.roi_wait_timeout_ms,
-            )
-        except Exception:
-            logger.warning("No table/grid appeared within timeout.")
+            # ── Encode image ────────────────────────────────────────
+            b64: str = base64.b64encode(screenshot_bytes).decode("ascii")
+            data_url: str = f"data:image/png;base64,{b64}"
 
-        # Gather all candidate elements
-        candidates: list[ElementHandle] = await page.query_selector_all(
-            _TABLE_SELECTORS
-        )
-        if not candidates:
-            raise ScoutError(
-                "No table or grid-like elements found on the page."
+            logger.debug(
+                "Vision ROI: sending {}KB to {}.",
+                len(screenshot_bytes) // 1024,
+                self._config.vision_model,
             )
 
-        logger.debug("ROI: {} candidates found.", len(candidates))
-
-        best_score: float = -1.0
-        best_handle: ElementHandle | None = None
-        best_meta: dict[str, Any] = {}
-
-        for handle in candidates:
-            try:
-                meta = await self._score_candidate(handle)
-            except Exception as exc:
-                logger.trace("Skipping candidate: {}", exc)
-                continue
-            if meta is None:
-                continue
-            if meta["score"] > best_score:
-                best_score = meta["score"]
-                best_handle = handle
-                best_meta = meta
-
-        if best_handle is None:
-            raise ScoutError(
-                "All candidate elements were too small or data-sparse "
-                "to qualify as the primary data table."
+            # ── Call Groq Vision ────────────────────────────────────
+            response = self._groq.chat.completions.create(
+                model=self._config.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _VISION_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                            },
+                        ],
+                    },
+                ],
+                temperature=0.0,
+                max_tokens=64,
             )
 
-        logger.info(
-            "ROI winner: <{tag}> score={score:.0f}, "
-            "area={area}px², density={density}.",
-            tag=best_meta["tag"],
-            score=best_score,
-            area=(
-                best_meta["bounding_box"]["width"]
-                * best_meta["bounding_box"]["height"]
-            ),
-            density=best_meta["data_density"],
-        )
-        return best_handle, best_meta
+            raw_text: str = response.choices[0].message.content.strip()
+            logger.debug("Vision ROI raw response: {}", raw_text)
 
-    # ── Candidate Scoring ───────────────────────────────────────────
+            # ── Parse [ymin, xmin, ymax, xmax] ──────────────────────
+            # Strip markdown fences if the model wraps in ```json
+            cleaned = raw_text
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1]
+            if cleaned.endswith("```"):
+                cleaned = cleaned.rsplit("```", 1)[0]
+            cleaned = cleaned.strip()
+
+            coords: list[int] = json.loads(cleaned)
+            if not isinstance(coords, list) or len(coords) != 4:
+                raise ValueError(
+                    f"Expected [ymin, xmin, ymax, xmax], got: {coords}"
+                )
+
+            ymin, xmin, ymax, xmax = [int(c) for c in coords]
+
+            # Sanity checks
+            if ymin >= ymax or xmin >= xmax:
+                raise ValueError(
+                    f"Invalid bbox: ymin={ymin} >= ymax={ymax} "
+                    f"or xmin={xmin} >= xmax={xmax}"
+                )
+            if ymax - ymin < 50 or xmax - xmin < 50:
+                raise ValueError(
+                    f"Bbox too small: {xmax - xmin}×{ymax - ymin} px"
+                )
+
+            bbox: dict[str, int] = {
+                "x": max(0, xmin),
+                "y": max(0, ymin),
+                "width": xmax - xmin,
+                "height": ymax - ymin,
+            }
+
+            logger.info(
+                "Vision ROI detected: x={}, y={}, {}×{} px.",
+                bbox["x"], bbox["y"], bbox["width"], bbox["height"],
+            )
+            return bbox, "vision", None
+
+        except Exception as exc:
+            logger.warning(
+                "Vision ROI failed ({}), falling back to full-page crop.",
+                exc,
+            )
+            return self._fallback_bbox(screenshot_bytes), "fallback", None
 
     @staticmethod
-    async def _score_candidate(
-        handle: ElementHandle,
-    ) -> dict[str, Any] | None:
-        """Evaluate a single DOM element as a potential ROI.
+    def _fallback_bbox(screenshot_bytes: bytes) -> dict[str, int]:
+        """Generate a full-viewport fallback bbox.
 
-        Returns ``None`` (silently skips) if the element fails any gate:
-        area too small, too few rows, or too few columns.
+        Uses the standard viewport size as the crop region.
         """
-        bbox = await handle.bounding_box()
-        if bbox is None:
-            return None
-
-        width = int(bbox["width"])
-        height = int(bbox["height"])
-        area = width * height
-
-        if area < _MIN_ROI_AREA_PX:
-            return None
-
-        tag: str = await handle.evaluate("el => el.tagName.toLowerCase()")
-
-        # ── Count data rows & columns ──────────────────────────────
-        if tag == "table":
-            row_count: int = await handle.evaluate(
-                "el => el.querySelectorAll('tr').length"
-            )
-            col_count: int = await handle.evaluate(
-                """el => {
-                    const row = el.querySelector('tr');
-                    return row
-                        ? row.querySelectorAll('td, th').length
-                        : 0;
-                }"""
-            )
-        else:
-            # Div-based grids (AG Grid, MUI DataGrid, Ant Design, etc.)
-            row_count = await handle.evaluate(
-                """el => {
-                    const explicit = el.querySelectorAll(
-                        '[role="row"], .row, tr'
-                    ).length;
-                    return explicit || el.children.length;
-                }"""
-            )
-            col_count = await handle.evaluate(
-                """el => {
-                    const firstRow = el.querySelector(
-                        '[role="row"], .row, tr'
-                    );
-                    if (firstRow) return firstRow.children.length;
-                    const cols = getComputedStyle(el)
-                        .gridTemplateColumns;
-                    return cols
-                        ? cols.split(' ').length
-                        : 1;
-                }"""
-            )
-
-        if row_count < _MIN_ROI_ROWS or col_count < _MIN_ROI_COLS:
-            return None
-
-        density = row_count * col_count
-        score = area * math.log(density + 1)
-
-        # Build a best-effort CSS selector for downstream reference
-        selector: str = await handle.evaluate(
-            """el => {
-                if (el.id) return '#' + el.id;
-                let sel = el.tagName.toLowerCase();
-                if (el.className && typeof el.className === 'string') {
-                    sel += '.' + el.className.trim()
-                        .split(/\\s+/).join('.');
-                }
-                return sel;
-            }"""
-        )
-
         return {
-            "tag": tag,
-            "bounding_box": {
-                "x": int(bbox["x"]),
-                "y": int(bbox["y"]),
-                "width": width,
-                "height": height,
-            },
-            "row_count": row_count,
-            "col_count": col_count,
-            "data_density": density,
-            "score": score,
-            "selector": selector,
+            "x": 0,
+            "y": 0,
+            "width": 1920,
+            "height": 1080,
         }
