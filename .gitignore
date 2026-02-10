@@ -11,6 +11,9 @@ dist/
 build/
 *.egg
 
+# ── Debug artifacts ──────────────────────────────────────────────────
+debug_roi.png
+
 # ── ChromaDB persistence ────────────────────────────────────────────
 chroma_db/
 
