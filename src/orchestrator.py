@@ -40,12 +40,20 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Any, Type, TypeVar
 
 from loguru import logger
 from pydantic import BaseModel
 
+from src.domain.events import (
+    CorrectionDetail,
+    FlightRecord,
+    LockResult,
+    MemoryResult,
+    ScoutResult,
+)
 from src.lock.engine import GrammarLock, LockError
 from src.memory.store import MemoryStore, MemoryStoreError
 from src.scout.engine import AsyncScout, ScoutConfig, ScoutError
@@ -151,7 +159,7 @@ class Pipeline:
         url: str,
         schema: Type[T],
         context_text: str = "",
-    ) -> tuple[bytes, T]:
+    ) -> tuple[FlightRecord, T]:
         """Execute the full extraction pipeline.
 
         Parameters
@@ -165,8 +173,8 @@ class Pipeline:
 
         Returns
         -------
-        tuple[bytes, T]
-            ``(screenshot_png_bytes, corrected_data_object)``
+        tuple[FlightRecord, T]
+            ``(flight_record, corrected_data_object)``
 
         Raises
         ------
@@ -179,37 +187,63 @@ class Pipeline:
             # ── Stage 1: Scout ──────────────────────────────────────
             logger.info("Stage 1/3: Scout — capturing ROI.")
             async with AsyncScout(config=self._scout_config) as scout:
-                capture: dict[str, Any] = await scout.capture(url)
+                scout_result: ScoutResult = await scout.capture(url)
 
-            image_bytes: bytes = capture["screenshot_bytes"]
-            roi = capture["roi_metadata"]
             logger.info(
-                "Scout complete — {}x{} px ROI (method={}).",
-                roi["bounding_box"]["width"],
-                roi["bounding_box"]["height"],
-                roi["detection_method"],
+                "Scout complete — {} coords, method={}, {:.0f}ms.",
+                scout_result.roi_coords,
+                scout_result.detection_method,
+                scout_result.latency_ms,
             )
 
             # ── Debug: save screenshot to disk ──────────────────────
             debug_path = Path("debug_roi.png")
-            debug_path.write_bytes(image_bytes)
+            debug_path.write_bytes(scout_result.image_bytes)
             logger.info("Debug screenshot saved → {}", debug_path.resolve())
 
             # ── Stage 2: Lock ───────────────────────────────────────
             logger.info("Stage 2/3: Lock — extracting {}.", schema.__name__)
-            extracted: T = self._lock.extract(
-                image_data=image_bytes,
+            lock_result: LockResult = self._lock.extract(
+                image_data=scout_result.image_bytes,
                 schema=schema,
                 context_text=context_text,
             )
-            logger.info("Lock complete — {} extracted.", schema.__name__)
+            logger.info(
+                "Lock complete — {} extracted ({:.0f}ms, {} tokens).",
+                schema.__name__,
+                lock_result.latency_ms,
+                lock_result.tokens_used,
+            )
 
             # ── Stage 3: Memory (Self-Healing) ──────────────────────
             logger.info("Stage 3/3: Memory — applying corrections.")
-            corrected: T = self._apply_corrections(extracted)
+            t_mem_start: float = time.perf_counter()
+            corrected, corrections = self._apply_corrections(
+                lock_result.data
+            )
+            mem_latency_ms = (time.perf_counter() - t_mem_start) * 1000
 
-            logger.success("Pipeline complete for {}.", url)
-            return image_bytes, corrected
+            memory_result = MemoryResult(
+                final_data=corrected,
+                corrections=corrections,
+                latency_ms=round(mem_latency_ms, 1),
+            )
+
+            # ── Assemble FlightRecord ─────────────────────────────
+            flight_record = FlightRecord(
+                scout=scout_result,
+                lock=lock_result,
+                memory=memory_result,
+            )
+
+            logger.success(
+                "Pipeline complete for {} — total {:.0f}ms, "
+                "{} corrections applied.",
+                url,
+                flight_record.total_latency_ms,
+                len(corrections),
+            )
+            return flight_record, corrected
 
         except (ScoutError, LockError, MemoryStoreError) as exc:
             logger.error("Pipeline domain error: {}", exc)
@@ -224,20 +258,16 @@ class Pipeline:
 
     # ── Self-Healing ────────────────────────────────────────────────
 
-    def _apply_corrections(self, obj: T) -> T:
+    def _apply_corrections(
+        self, obj: T
+    ) -> tuple[T, list[CorrectionDetail]]:
         """Recursively walk a Pydantic model and fix string fields.
 
-        For every string field, queries Memory for a semantically
-        similar past mistake.  If a confident match is found
-        (distance < threshold), the value is replaced with the
-        stored correction.
-
-        Handles:
-          - Top-level ``str`` fields.
-          - Nested ``BaseModel`` fields (recursive).
-          - ``list[BaseModel]`` fields (each item checked).
+        Returns the (potentially new) model plus a list of every
+        correction applied, for audit in the ``MemoryResult``.
         """
         updates: dict[str, Any] = {}
+        corrections: list[CorrectionDetail] = []
 
         for field_name in obj.model_fields:
             value = getattr(obj, field_name)
@@ -250,6 +280,11 @@ class Pipeline:
                 fix = self._memory.recall_correction(value, field_name)
                 if fix is not None:
                     updates[field_name] = fix
+                    corrections.append(CorrectionDetail(
+                        field_name=field_name,
+                        original_value=value,
+                        corrected_value=fix,
+                    ))
                     logger.debug(
                         "Corrected {}: '{}' → '{}'.",
                         field_name,
@@ -263,8 +298,11 @@ class Pipeline:
                 list_modified = False
                 for item in value:
                     if isinstance(item, BaseModel):
-                        corrected = self._apply_corrections(item)
+                        corrected, sub_corrections = (
+                            self._apply_corrections(item)
+                        )
                         new_items.append(corrected)
+                        corrections.extend(sub_corrections)
                         if corrected is not item:
                             list_modified = True
                     else:
@@ -274,7 +312,10 @@ class Pipeline:
 
             # ── Nested BaseModel → recurse ──────────────────────────
             elif isinstance(value, BaseModel):
-                corrected = self._apply_corrections(value)
+                corrected, sub_corrections = (
+                    self._apply_corrections(value)
+                )
+                corrections.extend(sub_corrections)
                 if corrected is not value:
                     updates[field_name] = corrected
 
@@ -284,8 +325,8 @@ class Pipeline:
                 len(updates),
                 type(obj).__name__,
             )
-            return obj.model_copy(update=updates)
-        return obj
+            return obj.model_copy(update=updates), corrections
+        return obj, corrections
 
     # ── Teaching ────────────────────────────────────────────────────
 

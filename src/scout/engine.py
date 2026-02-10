@@ -45,7 +45,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from src.domain.trace import Trace
+from src.domain.events import ScoutResult
 
 # ────────────────────────────────────────────────────────────────────
 # Constants
@@ -294,8 +294,8 @@ class AsyncScout:
 
     # ── Public API ──────────────────────────────────────────────────
 
-    async def capture(self, url: str) -> dict[str, Any]:
-        """Scout a URL and return a targeted screenshot of the data region.
+    async def capture(self, url: str) -> ScoutResult:
+        """Scout a URL and return a typed result envelope.
 
         Parameters
         ----------
@@ -304,11 +304,9 @@ class AsyncScout:
 
         Returns
         -------
-        dict
-            ``screenshot_bytes`` — PNG bytes of the ROI crop.
-            ``roi_metadata``     — dict with ``bounding_box``,
-            ``detection_method``, ``vision_confidence``.
-            ``trace``            — ``Trace`` dataclass with timing info.
+        ScoutResult
+            Typed envelope with ``image_bytes``, ``roi_coords``,
+            ``detection_method``, ``vision_confidence``, ``latency_ms``.
 
         Raises
         ------
@@ -370,18 +368,13 @@ class AsyncScout:
                 # Fallback: use the full-page screenshot as-is
                 roi_screenshot = full_screenshot
 
-            # ── Build metadata ─────────────────────────────────────
+            # ── Build ScoutResult envelope ──────────────────────────
             scout_latency_ms = (time.perf_counter() - t_start) * 1000
-            roi_meta: dict[str, Any] = {
-                "bounding_box": bbox,
-                "detection_method": detection_method,
-                "vision_confidence": vision_confidence,
-            }
-            trace = Trace(
-                scout_latency_ms=round(scout_latency_ms, 1),
-                detection_method=detection_method,
-                vision_confidence=vision_confidence,
-            )
+            roi_coords: list[int] = [
+                bbox["y"], bbox["x"],
+                bbox["y"] + bbox["height"],
+                bbox["x"] + bbox["width"],
+            ]
 
             logger.success(
                 "Captured ROI — {}×{} px, method={}, "
@@ -392,11 +385,13 @@ class AsyncScout:
                 vision_confidence,
                 scout_latency_ms,
             )
-            return {
-                "screenshot_bytes": roi_screenshot,
-                "roi_metadata": roi_meta,
-                "trace": trace,
-            }
+            return ScoutResult(
+                image_bytes=roi_screenshot,
+                roi_coords=roi_coords,
+                detection_method=detection_method,
+                vision_confidence=vision_confidence,
+                latency_ms=round(scout_latency_ms, 1),
+            )
 
         except ScoutError:
             raise
