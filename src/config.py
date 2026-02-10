@@ -81,9 +81,9 @@ class Settings:
     # ── Core Properties ─────────────────────────────────────────────
 
     @property
-    def GEMINI_API_KEY(self) -> str:
-        """Google Gemini API key for the Lock module."""
-        return os.environ.get("GEMINI_API_KEY", "")
+    def GROQ_API_KEY(self) -> str:
+        """Groq API key for the Lock module."""
+        return os.environ.get("GROQ_API_KEY", "")
 
     @property
     def CHROMA_PATH(self) -> str:
@@ -110,9 +110,9 @@ class Settings:
         return raw in ("true", "1", "yes")
 
     @property
-    def GEMINI_MODEL(self) -> str:
-        """Gemini model name for the Lock module."""
-        return os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
+    def GROQ_MODEL(self) -> str:
+        """Groq model name for the Lock module."""
+        return os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
     @property
     def LOG_LEVEL(self) -> str:
@@ -131,32 +131,32 @@ class Settings:
         """
         ok = True
 
-        if not self.GEMINI_API_KEY:
+        if not self.GROQ_API_KEY:
             logger.warning(
-                "GEMINI_API_KEY is not set. "
+                "GROQ_API_KEY is not set. "
                 "The Lock module will not function. "
                 "Add it to .env or export it as an environment variable."
             )
             ok = False
         else:
             # Show only first/last 4 chars for confirmation
-            key = self.GEMINI_API_KEY
+            key = self.GROQ_API_KEY
             masked = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else "****"
-            logger.info("GEMINI_API_KEY loaded ({}).", masked)
+            logger.info("GROQ_API_KEY loaded ({}).", masked)
 
         logger.info("CHROMA_PATH  = {}", self.CHROMA_PATH)
         logger.info("HEADLESS     = {}", self.HEADLESS)
-        logger.info("GEMINI_MODEL = {}", self.GEMINI_MODEL)
+        logger.info("GROQ_MODEL   = {}", self.GROQ_MODEL)
         logger.info("LOG_LEVEL    = {}", self.LOG_LEVEL)
 
         return ok
 
     def __repr__(self) -> str:
         return (
-            f"Settings(GEMINI_API_KEY={'SET' if self.GEMINI_API_KEY else 'MISSING'}, "
+            f"Settings(GROQ_API_KEY={'SET' if self.GROQ_API_KEY else 'MISSING'}, "
             f"CHROMA_PATH={self.CHROMA_PATH!r}, "
             f"HEADLESS={self.HEADLESS}, "
-            f"GEMINI_MODEL={self.GEMINI_MODEL!r})"
+            f"GROQ_MODEL={self.GROQ_MODEL!r})"
         )
 
 
