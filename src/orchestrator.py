@@ -111,10 +111,14 @@ class Pipeline:
         memory: MemoryStore,
         *,
         headless: bool = True,
+        groq_api_key: str = "",
     ) -> None:
         self._lock: GrammarLock = lock
         self._memory: MemoryStore = memory
-        self._scout_config: ScoutConfig = ScoutConfig(headless=headless)
+        self._scout_config: ScoutConfig = ScoutConfig(
+            headless=headless,
+            groq_api_key=groq_api_key,
+        )
 
         logger.info("Pipeline initialised.")
 
@@ -180,9 +184,10 @@ class Pipeline:
             image_bytes: bytes = capture["screenshot_bytes"]
             roi = capture["roi_metadata"]
             logger.info(
-                "Scout complete — {}x{} px ROI.",
+                "Scout complete — {}x{} px ROI (method={}).",
                 roi["bounding_box"]["width"],
                 roi["bounding_box"]["height"],
+                roi["detection_method"],
             )
 
             # ── Debug: save screenshot to disk ──────────────────────

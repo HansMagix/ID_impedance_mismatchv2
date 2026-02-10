@@ -179,7 +179,7 @@ extract_clicked: bool = st.button(
 # ────────────────────────────────────────────────────────────────────
 
 if extract_clicked and all_systems_go and lock is not None:
-    pipeline = Pipeline(lock=lock, memory=memory)
+    pipeline = Pipeline(lock=lock, memory=memory, groq_api_key=api_key)
 
     progress = st.progress(0, text="Initialising Scout...")
 
@@ -266,7 +266,7 @@ if st.session_state.get("original_items"):
         )
 
     if teach_clicked and lock is not None:
-        pipeline = Pipeline(lock=lock, memory=memory)
+        pipeline = Pipeline(lock=lock, memory=memory, groq_api_key=api_key)
         changes: list[tuple[str, str, str]] = []
 
         min_rows = min(len(original_df), len(edited_df))
