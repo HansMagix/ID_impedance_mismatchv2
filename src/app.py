@@ -99,10 +99,10 @@ with st.sidebar:
 
     # ── API Key ─────────────────────────────────────────────────────
     api_key: str = st.text_input(
-        "Gemini API Key",
+        "Groq API Key",
         type="password",
-        value=settings.GEMINI_API_KEY,
-        help="Required for the Lock module (Gemini 1.5 Flash).",
+        value=settings.GROQ_API_KEY,
+        help="Required for the Lock module (Llama 3.2 Vision via Groq).",
     )
 
     st.markdown("---")
@@ -122,7 +122,7 @@ with st.sidebar:
     lock: GrammarLock | None = _init_lock(api_key)
     lock_ok = lock is not None
     if lock_ok:
-        st.markdown("\U0001f7e2 **Lock** — Gemini configured")
+        st.markdown("\U0001f7e2 **Lock** — Groq configured")
     else:
         st.markdown("\U0001f534 **Lock** — No API key")
 
