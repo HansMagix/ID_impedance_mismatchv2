@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcaw"
+version = "0.1.0"
+description = "Grammar-Constrained Agentic Workstation — Industrial Data Extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    # Scout
+    "playwright>=1.40.0",
+    "loguru>=0.7.0",
+
+    # Lock
+    "google-generativeai>=0.8.0",
+    "instructor>=1.5.0",
+    "pydantic>=2.5.0",
+    "tenacity>=8.2.0",
+    "Pillow>=10.0.0",
+
+    # Memory
+    "chromadb>=0.5.0",
+
+    # Config
+    "python-dotenv>=1.0.0",
+
+    # UI
+    "streamlit>=1.28.0",
+    "pandas>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 79
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
