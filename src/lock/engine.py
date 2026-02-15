@@ -56,6 +56,8 @@ import instructor
 from groq import Groq
 from loguru import logger
 from pydantic import BaseModel
+from src.config import settings
+from src.domain.events import LockResult
 from tenacity import (
     RetryCallState,
     retry,
@@ -206,25 +208,23 @@ class GrammarLock:
         image_data: bytes,
         schema: Type[T],
         context_text: str = "",
-    ) -> T:
-        """Extract structured data from an image into a Pydantic model.
+    ) -> LockResult:
+        """Extract structured data from an image into a LockResult envelope.
 
         Parameters
         ----------
         image_data : bytes
-            Raw PNG/JPEG bytes (typically from ``AsyncScout.capture``).
+            Raw screenshot PNG bytes.
         schema : Type[T]
-            Any Pydantic V2 ``BaseModel`` subclass.  The Lock will
-            force the LLM's output to match this schema exactly.
+            Target Pydantic V2 model class.
         context_text : str, optional
-            Free-text hint for the model (e.g. *"table contains cement
-            prices from Q3 2024"*).  Appended to the system prompt.
+            Free-text hint for the LLM.
 
         Returns
         -------
-        T
-            A validated instance of ``schema``, populated from the
-            image content.
+        LockResult
+            Typed envelope with ``data`` (validated ``T``), ``tokens_used``,
+            ``validation_retries``, ``model_name``, ``latency_ms``.
 
         Raises
         ------
@@ -233,10 +233,30 @@ class GrammarLock:
             instructor validation retries and tenacity API retries).
         """
         logger.info("── Lock: extract(schema={}) ──", schema.__name__)
+        import time
+        t_start: float = time.perf_counter()
 
         try:
-            return self._extract_with_retry(
+            data: T = self._extract_with_retry(
                 image_data, schema, context_text
+            )
+            latency_ms = (time.perf_counter() - t_start) * 1000
+
+            # Attempt to extract token usage from instructor's raw response
+            tokens_used: int = 0
+            try:
+                raw = getattr(data, "_raw_response", None)
+                if raw and hasattr(raw, "usage"):
+                    tokens_used = getattr(raw.usage, "total_tokens", 0)
+            except Exception:
+                pass
+
+            return LockResult(
+                data=data,
+                tokens_used=tokens_used,
+                validation_retries=self._config.max_validation_retries,
+                model_name=self._config.model_name,
+                latency_ms=round(latency_ms, 1),
             )
         except LockError:
             raise

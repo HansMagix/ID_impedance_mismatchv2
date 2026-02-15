@@ -39,6 +39,7 @@ import pandas as pd
 import streamlit as st
 
 from src.config import settings
+from src.domain.events import FlightRecord
 from src.lock.engine import GrammarLock
 from src.lock.schemas import IndustrialItem
 from src.memory.store import MemoryStore
@@ -185,7 +186,7 @@ if extract_clicked and all_systems_go and lock is not None:
 
     try:
         progress.progress(15, text="\U0001f575\ufe0f Scout: Navigating...")
-        image_bytes, data = pipeline.run_sync(
+        flight_record, data = pipeline.run_sync(
             url=url.strip(),
             schema=IndustrialItem,
             context_text=context.strip(),
@@ -193,7 +194,8 @@ if extract_clicked and all_systems_go and lock is not None:
         progress.progress(100, text="\u2705 Extraction complete!")
 
         # Persist to session state
-        st.session_state["image_bytes"] = image_bytes
+        st.session_state["flight_record"] = flight_record
+        st.session_state["image_bytes"] = flight_record.scout.image_bytes
         st.session_state["data"] = data
         st.session_state["original_items"] = [
             item.model_dump() for item in data.items
@@ -213,7 +215,7 @@ if st.session_state.get("original_items"):
     st.markdown("---")
     st.subheader("\U0001f4cb Results")  # 📋
 
-    # ── Metadata ────────────────────────────────────────────────────
+    # ── Metadata ──────────────────────────────────────────────────
     title = st.session_state.get("source_title")
     notes = st.session_state.get("extraction_notes")
     if title:
@@ -221,21 +223,75 @@ if st.session_state.get("original_items"):
     if notes:
         st.info(f"\U0001f4dd {notes}")  # 📝
 
-    # ── Two-column layout ──────────────────────────────────────────
-    col1, col2 = st.columns([1, 1], gap="large")
+    # ── Explainable AI Tabs (Process Timeline) ────────────────────
+    fr: FlightRecord | None = st.session_state.get("flight_record")
 
-    # ── Column 1: Visual Verification ──────────────────────────────
-    with col1:
-        st.markdown("#### \U0001f4f8 Visual Verification")  # 📸
+    tab_vision, tab_logic, tab_healing, tab_data = st.tabs([
+        "\U0001f50d Vision",  # 🔍
+        "\U0001f9ea Logic",   # 🧪
+        "\U0001f9e0 Self-Healing",  # 🧠
+        "\U0001f4ca Data",   # 📊
+    ])
+
+    # ── Tab 1: Vision ─────────────────────────────────────────
+    with tab_vision:
+        st.markdown("#### \U0001f4f8 ROI Detection")  # 📸
         if st.session_state.get("image_bytes"):
             st.image(
                 st.session_state["image_bytes"],
                 caption="ROI captured by Scout",
                 use_container_width=True,
             )
+        if fr:
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Detection Method", fr.scout.detection_method)
+            col_b.metric("Latency", f"{fr.scout.latency_ms:.0f} ms")
+            col_c.metric(
+                "Confidence",
+                f"{fr.scout.vision_confidence:.2f}"
+                if fr.scout.vision_confidence is not None
+                else "N/A",
+            )
+            st.caption(
+                f"ROI Coords: `{fr.scout.roi_coords}`"
+            )
 
-    # ── Column 2: Data Editor ──────────────────────────────────────
-    with col2:
+    # ── Tab 2: Logic ──────────────────────────────────────────
+    with tab_logic:
+        st.markdown("#### \U0001f916 LLM Extraction")  # 🤖
+        if fr:
+            col_d, col_e, col_f = st.columns(3)
+            col_d.metric("Model", fr.lock.model_name.split("/")[-1])
+            col_e.metric("Tokens Used", fr.lock.tokens_used or "~")
+            col_f.metric("Latency", f"{fr.lock.latency_ms:.0f} ms")
+            st.caption(
+                f"Max validation retries: {fr.lock.validation_retries}"
+            )
+
+    # ── Tab 3: Self-Healing ───────────────────────────────────
+    with tab_healing:
+        st.markdown("#### \U0001f9ec Correction Audit Trail")  # 🧬
+        if fr and fr.memory.corrections:
+            for c in fr.memory.corrections:
+                st.markdown(
+                    f"- **{c.field_name}**: "
+                    f"`{c.original_value}` → `{c.corrected_value}`"
+                )
+            st.metric(
+                "Memory Latency",
+                f"{fr.memory.latency_ms:.0f} ms",
+            )
+        else:
+            st.caption("No auto-corrections were applied.")
+
+        if fr:
+            st.metric(
+                "Total Pipeline Latency",
+                f"{fr.total_latency_ms:.0f} ms",
+            )
+
+    # ── Tab 4: Data Editor ────────────────────────────────────
+    with tab_data:
         st.markdown("#### \U0001f4ca Extracted Data")  # 📊
 
         original_df = pd.DataFrame(st.session_state["original_items"])
