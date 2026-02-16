@@ -94,7 +94,7 @@ class LockResult(BaseModel):
     )
     inferred_schema: dict | None = Field(
         default=None,
-        description="SchemaDefinition dict if dynamic mode was used.",
+        description="SchemaDefinition dict when dynamic mode is used.",
     )
 
     model_config = {"arbitrary_types_allowed": True}

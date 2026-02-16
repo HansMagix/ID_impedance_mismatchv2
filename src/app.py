@@ -142,22 +142,6 @@ with st.sidebar:
     else:
         st.warning("Some systems need configuration.")
 
-    # ── Dynamic Schema Toggle ────────────────────────────────────────
-    st.markdown("---")
-    dynamic_mode: bool = st.toggle(
-        "\U0001f9ec Dynamic Schema Mode",  # 🧬
-        value=False,
-        help=(
-            "When ON, the Lock infers the schema autonomously "
-            "(Two-Pass). When OFF, uses the static IndustrialItem "
-            "schema."
-        ),
-    )
-    if dynamic_mode:
-        st.caption("\U0001f50d Agent will discover fields autonomously.")
-    else:
-        st.caption("\U0001f512 Using static IndustrialItem schema.")
-
 # ────────────────────────────────────────────────────────────────────
 # Main Area — Header
 # ────────────────────────────────────────────────────────────────────
@@ -181,7 +165,17 @@ url: str = st.text_input(
 context: str = st.text_input(
     "\U0001f4dd Context (optional)",  # 📝
     placeholder="e.g., Cement price list from Kenya, Q3 2024",
-    help="Extra context passed to Gemini for better accuracy.",
+    help="Extra context passed to the LLM for better accuracy.",
+)
+
+dynamic_mode: bool = st.toggle(
+    "\U0001f9ec Dynamic Schema Mode",  # 🧬
+    value=False,
+    help=(
+        "When enabled, the AI infers the data schema autonomously "
+        "(Two-Pass: Schema Inference → Data Extraction). "
+        "Uses ~2× tokens but works with any table layout."
+    ),
 )
 
 extract_disabled: bool = not (all_systems_go and url.strip())
@@ -203,7 +197,7 @@ if extract_clicked and all_systems_go and lock is not None:
     try:
         progress.progress(15, text="\U0001f575\ufe0f Scout: Navigating...")
 
-        chosen_schema = None if dynamic_mode else IndustrialItem
+        chosen_schema = IndustrialItem if not dynamic_mode else None
         flight_record, data = pipeline.run_sync(
             url=url.strip(),
             schema=chosen_schema,
@@ -217,18 +211,26 @@ if extract_clicked and all_systems_go and lock is not None:
         st.session_state["data"] = data
         st.session_state["dynamic_mode"] = dynamic_mode
 
-        # Static mode: data has .items / .source_title
-        # Dynamic mode: data is flat Pydantic model
-        if not dynamic_mode and hasattr(data, "items"):
+        # Build tabular records from either static or dynamic data
+        if dynamic_mode:
+            # Dynamic model: flat top-level fields
+            dump = data.model_dump()
+            # If the dump is a single row, wrap in list
+            if isinstance(dump, dict):
+                st.session_state["original_items"] = [dump]
+            else:
+                st.session_state["original_items"] = dump
+            st.session_state["source_title"] = None
+            st.session_state["extraction_notes"] = None
+        else:
+            # Static IndustrialItem with .items list
             st.session_state["original_items"] = [
                 item.model_dump() for item in data.items
             ]
             st.session_state["source_title"] = data.source_title
-            st.session_state["extraction_notes"] = data.extraction_notes
-        else:
-            st.session_state["original_items"] = [data.model_dump()]
-            st.session_state["source_title"] = None
-            st.session_state["extraction_notes"] = None
+            st.session_state["extraction_notes"] = (
+                data.extraction_notes
+            )
 
     except Exception as exc:
         progress.empty()
@@ -287,35 +289,46 @@ if st.session_state.get("original_items"):
     with tab_logic:
         st.markdown("#### \U0001f916 LLM Extraction")  # 🤖
         if fr:
-            col_d, col_e, col_f = st.columns(3)
-            col_d.metric("Model", fr.lock.model_name.split("/")[-1])
-            col_e.metric("Tokens Used", fr.lock.tokens_used or "~")
-            col_f.metric("Latency", f"{fr.lock.latency_ms:.0f} ms")
-
-            extraction_mode = (
-                "Two-Pass (Dynamic)" if fr.lock.inferred_schema
-                else "Static Schema"
+            is_dynamic = st.session_state.get("dynamic_mode", False)
+            mode_label = (
+                "Dynamic — Two-Pass" if is_dynamic else "Static"
+            )
+            col_d, col_e, col_f, col_g = st.columns(4)
+            col_d.metric("Mode", mode_label)
+            col_e.metric(
+                "Model", fr.lock.model_name.split("/")[-1]
+            )
+            col_f.metric(
+                "Tokens Used", fr.lock.tokens_used or "~"
+            )
+            col_g.metric(
+                "Latency", f"{fr.lock.latency_ms:.0f} ms"
             )
             st.caption(
-                f"Mode: **{extraction_mode}** · "
                 f"Max validation retries: {fr.lock.validation_retries}"
             )
 
-            # Inferred Schema Expander (dynamic mode only)
+            # ── Inferred Schema Expander (dynamic mode only) ──────
             if fr.lock.inferred_schema:
                 with st.expander(
                     "\U0001f9ec Inferred Schema", expanded=True  # 🧬
                 ):
-                    schema_info = fr.lock.inferred_schema
+                    schema_dict = fr.lock.inferred_schema
                     st.markdown(
-                        f"**Entity:** `{schema_info.get('entity_name', '?')}`"
+                        f"**Entity:** `{schema_dict.get('entity_name', '?')}`"
                     )
-                    for field in schema_info.get("fields", []):
-                        st.markdown(
-                            f"- `{field['name']}` : "
-                            f"**{field['type']}** — "
-                            f"{field.get('description', '')}"
-                        )
+                    fields = schema_dict.get("fields", [])
+                    if fields:
+                        schema_rows = []
+                        for f in fields:
+                            schema_rows.append({
+                                "Field": f.get("name", ""),
+                                "Type": f.get("type", "str"),
+                                "Description": f.get(
+                                    "description", ""
+                                ),
+                            })
+                        st.table(pd.DataFrame(schema_rows))
 
     # ── Tab 3: Self-Healing ───────────────────────────────────
     with tab_healing:
