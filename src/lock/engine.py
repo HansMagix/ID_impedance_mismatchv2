@@ -58,6 +58,10 @@ from loguru import logger
 from pydantic import BaseModel
 from src.config import settings
 from src.domain.events import LockResult
+from src.lock.dynamic import (
+    SchemaDefinition,
+    compile_pydantic_model,
+)
 from tenacity import (
     RetryCallState,
     retry,
@@ -351,3 +355,148 @@ class GrammarLock:
             total,
         )
         return result
+
+    # ── Dynamic Schema Inference (Pass 1) ────────────────────────────
+
+    def infer_schema(
+        self,
+        image_data: bytes,
+        context_text: str = "",
+    ) -> SchemaDefinition:
+        """Pass 1 — Ask the LLM to describe the data schema.
+
+        The model examines the screenshot and outputs a
+        ``SchemaDefinition`` listing the fields it observes.
+
+        Parameters
+        ----------
+        image_data : bytes
+            Raw screenshot PNG bytes.
+        context_text : str, optional
+            Free-text hint for the LLM.
+
+        Returns
+        -------
+        SchemaDefinition
+            Meta-schema describing entity name and field types.
+        """
+        logger.info("── Lock: infer_schema (Pass 1) ──")
+
+        b64: str = base64.b64encode(image_data).decode("ascii")
+        data_url: str = f"data:image/png;base64,{b64}"
+
+        schema_prompt: str = (
+            "You are a data analyst. Examine this image of a data table. "
+            "Identify the entity being listed and ALL columns/fields visible. "
+            "For each field, choose an appropriate Python type "
+            "(str, int, float, or bool). "
+            "Return a JSON object with 'entity_name' (PascalCase) and "
+            "'fields' (list of {name, type, description}). "
+            "Use snake_case for field names. "
+            "NO PREAMBLE. JSON ONLY."
+        )
+        if context_text:
+            schema_prompt += f"\n\nAdditional context: {context_text}"
+
+        result: SchemaDefinition = self._client.chat.completions.create(
+            model=self._config.model_name,
+            response_model=SchemaDefinition,
+            max_retries=self._config.max_validation_retries,
+            max_tokens=self._config.max_output_tokens,
+            temperature=self._config.temperature,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": schema_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                },
+            ],
+        )
+
+        logger.success(
+            "Schema inferred: '{}' with {} fields.",
+            result.entity_name,
+            len(result.fields),
+        )
+        return result
+
+    # ── Dynamic Extraction (Pass 1 + Pass 2) ─────────────────────────
+
+    def extract_dynamic(
+        self,
+        image_data: bytes,
+        context_text: str = "",
+    ) -> LockResult:
+        """Two-Pass extraction: infer schema, then extract data.
+
+        1. Calls ``infer_schema()`` to discover the data structure.
+        2. Compiles it into a live Pydantic model.
+        3. Calls ``_extract_with_retry()`` against that model.
+        4. Returns a ``LockResult`` with the inferred schema attached.
+
+        Parameters
+        ----------
+        image_data : bytes
+            Raw screenshot PNG bytes.
+        context_text : str, optional
+            Free-text hint for the LLM.
+
+        Returns
+        -------
+        LockResult
+            Envelope with extracted data + ``inferred_schema`` dict.
+        """
+        import time
+        logger.info("── Lock: extract_dynamic (Two-Pass) ──")
+        t_start: float = time.perf_counter()
+
+        try:
+            # ── Pass 1: Schema Inference ────────────────────────────
+            schema_def: SchemaDefinition = self.infer_schema(
+                image_data, context_text
+            )
+
+            # ── Compile → live Pydantic model ──────────────────────
+            DynamicModel = compile_pydantic_model(schema_def)
+            logger.info(
+                "Compiled dynamic model: {} ({} fields).",
+                DynamicModel.__name__,
+                len(DynamicModel.model_fields),
+            )
+
+            # ── Pass 2: Grammar-constrained extraction ─────────────
+            data = self._extract_with_retry(
+                image_data, DynamicModel, context_text
+            )
+            latency_ms = (time.perf_counter() - t_start) * 1000
+
+            # Attempt token usage from instructor
+            tokens_used: int = 0
+            try:
+                raw = getattr(data, "_raw_response", None)
+                if raw and hasattr(raw, "usage"):
+                    tokens_used = getattr(raw.usage, "total_tokens", 0)
+            except Exception:
+                pass
+
+            return LockResult(
+                data=data,
+                tokens_used=tokens_used,
+                validation_retries=self._config.max_validation_retries,
+                model_name=self._config.model_name,
+                latency_ms=round(latency_ms, 1),
+                inferred_schema=schema_def.model_dump(),
+            )
+
+        except LockError:
+            raise
+        except Exception as exc:
+            logger.exception("Dynamic extraction failed.")
+            raise LockError(
+                f"Dynamic extraction failed: {exc}"
+            ) from exc

@@ -135,9 +135,9 @@ class Pipeline:
     def run_sync(
         self,
         url: str,
-        schema: Type[T],
+        schema: Type[T] | None = None,
         context_text: str = "",
-    ) -> tuple[bytes, T]:
+    ) -> tuple[FlightRecord, Any]:
         """Synchronous wrapper around the async pipeline.
 
         Creates a fresh event loop via ``asyncio.run()``.  On Windows,
@@ -157,23 +157,24 @@ class Pipeline:
     async def run(
         self,
         url: str,
-        schema: Type[T],
+        schema: Type[T] | None = None,
         context_text: str = "",
-    ) -> tuple[FlightRecord, T]:
+    ) -> tuple[FlightRecord, Any]:
         """Execute the full extraction pipeline.
 
         Parameters
         ----------
         url : str
             Target URL containing an industrial data table.
-        schema : Type[T]
-            Pydantic V2 model defining the expected structure.
+        schema : Type[T] | None
+            Pydantic V2 model for static extraction, or ``None``
+            to trigger Two-Pass dynamic schema induction.
         context_text : str, optional
-            Free-text hint for the Lock (forwarded to Gemini).
+            Free-text hint for the Lock.
 
         Returns
         -------
-        tuple[FlightRecord, T]
+        tuple[FlightRecord, Any]
             ``(flight_record, corrected_data_object)``
 
         Raises
@@ -181,7 +182,8 @@ class Pipeline:
         PipelineError
             If any stage fails after its internal retries.
         """
-        logger.info("── Pipeline: run({}) ──", url)
+        mode_label = "dynamic" if schema is None else "static"
+        logger.info("── Pipeline: run({}) [{}] ──", url, mode_label)
 
         try:
             # ── Stage 1: Scout ──────────────────────────────────────
@@ -202,15 +204,31 @@ class Pipeline:
             logger.info("Debug screenshot saved → {}", debug_path.resolve())
 
             # ── Stage 2: Lock ───────────────────────────────────────
-            logger.info("Stage 2/3: Lock — extracting {}.", schema.__name__)
-            lock_result: LockResult = self._lock.extract(
-                image_data=scout_result.image_bytes,
-                schema=schema,
-                context_text=context_text,
+            if schema is not None:
+                logger.info(
+                    "Stage 2/3: Lock — static extract ({}).",
+                    schema.__name__,
+                )
+                lock_result: LockResult = self._lock.extract(
+                    image_data=scout_result.image_bytes,
+                    schema=schema,
+                    context_text=context_text,
+                )
+            else:
+                logger.info(
+                    "Stage 2/3: Lock — dynamic (Two-Pass) extract."
+                )
+                lock_result = self._lock.extract_dynamic(
+                    image_data=scout_result.image_bytes,
+                    context_text=context_text,
+                )
+            schema_label = (
+                schema.__name__ if schema is not None
+                else type(lock_result.data).__name__
             )
             logger.info(
                 "Lock complete — {} extracted ({:.0f}ms, {} tokens).",
-                schema.__name__,
+                schema_label,
                 lock_result.latency_ms,
                 lock_result.tokens_used,
             )

@@ -92,6 +92,10 @@ class LockResult(BaseModel):
         default=0.0,
         description="Wall-clock time for the Lock stage.",
     )
+    inferred_schema: dict | None = Field(
+        default=None,
+        description="SchemaDefinition dict if dynamic mode was used.",
+    )
 
     model_config = {"arbitrary_types_allowed": True}
 
