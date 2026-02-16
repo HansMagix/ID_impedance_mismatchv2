@@ -163,18 +163,15 @@ url: str = st.text_input(
 )
 
 context: str = st.text_input(
-    "\U0001f4dd Context (optional)",  # 📝
-    placeholder="e.g., Cement price list from Kenya, Q3 2024",
-    help="Extra context passed to the LLM for better accuracy.",
-)
-
-dynamic_mode: bool = st.toggle(
-    "\U0001f9ec Dynamic Schema Mode",  # 🧬
-    value=False,
+    "\U0001f4dd Context / Column Instructions",  # 📝
+    placeholder=(
+        "e.g., Extract the Product Name, Price (float), "
+        "and Warranty Period (string)"
+    ),
     help=(
-        "When enabled, the AI infers the data schema autonomously "
-        "(Two-Pass: Schema Inference → Data Extraction). "
-        "Uses ~2× tokens but works with any table layout."
+        "Steer the AI: specify the exact columns and data types "
+        "you need. If left empty, the AI infers the structure "
+        "autonomously from the visible data."
     ),
 )
 
@@ -197,10 +194,8 @@ if extract_clicked and all_systems_go and lock is not None:
     try:
         progress.progress(15, text="\U0001f575\ufe0f Scout: Navigating...")
 
-        chosen_schema = IndustrialItem if not dynamic_mode else None
         flight_record, data = pipeline.run_sync(
             url=url.strip(),
-            schema=chosen_schema,
             context_text=context.strip(),
         )
         progress.progress(100, text="\u2705 Extraction complete!")
@@ -209,28 +204,15 @@ if extract_clicked and all_systems_go and lock is not None:
         st.session_state["flight_record"] = flight_record
         st.session_state["image_bytes"] = flight_record.scout.image_bytes
         st.session_state["data"] = data
-        st.session_state["dynamic_mode"] = dynamic_mode
 
-        # Build tabular records from either static or dynamic data
-        if dynamic_mode:
-            # Dynamic model: flat top-level fields
-            dump = data.model_dump()
-            # If the dump is a single row, wrap in list
-            if isinstance(dump, dict):
-                st.session_state["original_items"] = [dump]
-            else:
-                st.session_state["original_items"] = dump
-            st.session_state["source_title"] = None
-            st.session_state["extraction_notes"] = None
+        # Build tabular records from dynamic model
+        dump = data.model_dump()
+        if isinstance(dump, dict):
+            st.session_state["original_items"] = [dump]
         else:
-            # Static IndustrialItem with .items list
-            st.session_state["original_items"] = [
-                item.model_dump() for item in data.items
-            ]
-            st.session_state["source_title"] = data.source_title
-            st.session_state["extraction_notes"] = (
-                data.extraction_notes
-            )
+            st.session_state["original_items"] = dump
+        st.session_state["source_title"] = None
+        st.session_state["extraction_notes"] = None
 
     except Exception as exc:
         progress.empty()
@@ -289,12 +271,8 @@ if st.session_state.get("original_items"):
     with tab_logic:
         st.markdown("#### \U0001f916 LLM Extraction")  # 🤖
         if fr:
-            is_dynamic = st.session_state.get("dynamic_mode", False)
-            mode_label = (
-                "Dynamic — Two-Pass" if is_dynamic else "Static"
-            )
             col_d, col_e, col_f, col_g = st.columns(4)
-            col_d.metric("Mode", mode_label)
+            col_d.metric("Mode", "Dynamic — Two-Pass")
             col_e.metric(
                 "Model", fr.lock.model_name.split("/")[-1]
             )

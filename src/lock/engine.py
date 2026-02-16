@@ -388,15 +388,28 @@ class GrammarLock:
         data_url: str = f"data:image/png;base64,{b64}"
 
         inference_prompt: str = (
-            "You are a data analyst. Examine this image of a data table. "
-            "Identify every column/field visible in the table. "
+            "You are a data analyst. Examine this image of a data table "
+            "or document. "
+        )
+        if context_text:
+            inference_prompt += (
+                f"The user has provided these instructions: "
+                f"'{context_text}'. Based PRIMARILY on these instructions, "
+                f"determine the required data fields. If the user asks for "
+                f"specific columns (e.g., Brand, Price), create exactly "
+                f"those fields with appropriate Python types. "
+            )
+        else:
+            inference_prompt += (
+                "No specific instructions were given. Infer the most "
+                "logical tabular structure from the visible data. "
+            )
+        inference_prompt += (
             "For each field, provide: a snake_case name, the Python type "
             "(str, int, float, or bool), and a brief description. "
             "Also provide an entity_name in PascalCase for the data. "
             "Return ONLY the JSON matching the schema. NO PREAMBLE."
         )
-        if context_text:
-            inference_prompt += f"\n\nAdditional context: {context_text}"
 
         try:
             schema_def: SchemaDefinition = (

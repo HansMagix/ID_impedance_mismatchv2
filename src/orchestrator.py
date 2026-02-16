@@ -135,7 +135,6 @@ class Pipeline:
     def run_sync(
         self,
         url: str,
-        schema: Type[T] | None = None,
         context_text: str = "",
     ) -> tuple[FlightRecord, BaseModel]:
         """Synchronous wrapper around the async pipeline.
@@ -150,14 +149,11 @@ class Pipeline:
             asyncio.set_event_loop_policy(
                 asyncio.WindowsProactorEventLoopPolicy()
             )
-        return asyncio.run(self.run(url, schema, context_text))
-
-    # ── Async API ───────────────────────────────────────────────────
+        return asyncio.run(self.run(url, context_text))
 
     async def run(
         self,
         url: str,
-        schema: Type[T] | None = None,
         context_text: str = "",
     ) -> tuple[FlightRecord, BaseModel]:
         """Execute the full extraction pipeline.
@@ -166,11 +162,8 @@ class Pipeline:
         ----------
         url : str
             Target URL containing an industrial data table.
-        schema : Type[T] | None
-            Pydantic V2 model defining the expected structure.
-            If ``None``, dynamic schema induction is used (Two-Pass).
         context_text : str, optional
-            Free-text hint for the Lock.
+            Free-text instructions for schema inference.
 
         Returns
         -------
@@ -202,25 +195,14 @@ class Pipeline:
             debug_path.write_bytes(scout_result.image_bytes)
             logger.info("Debug screenshot saved → {}", debug_path.resolve())
 
-            # ── Stage 2: Lock ───────────────────────────────────────
-            if schema is not None:
-                logger.info(
-                    "Stage 2/3: Lock (static) — extracting {}.",
-                    schema.__name__,
-                )
-                lock_result: LockResult = self._lock.extract(
-                    image_data=scout_result.image_bytes,
-                    schema=schema,
-                    context_text=context_text,
-                )
-            else:
-                logger.info(
-                    "Stage 2/3: Lock (dynamic) — Two-Pass extraction."
-                )
-                lock_result = self._lock.extract_dynamic(
-                    image_data=scout_result.image_bytes,
-                    context_text=context_text,
-                )
+            # ── Stage 2: Lock (Dynamic Two-Pass) ────────────────────
+            logger.info(
+                "Stage 2/3: Lock — Two-Pass dynamic extraction."
+            )
+            lock_result: LockResult = self._lock.extract_dynamic(
+                image_data=scout_result.image_bytes,
+                context_text=context_text,
+            )
             logger.info(
                 "Lock complete — {:.0f}ms, {} tokens.",
                 lock_result.latency_ms,
