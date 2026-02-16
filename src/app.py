@@ -142,6 +142,22 @@ with st.sidebar:
     else:
         st.warning("Some systems need configuration.")
 
+    # ── Dynamic Schema Toggle ────────────────────────────────────────
+    st.markdown("---")
+    dynamic_mode: bool = st.toggle(
+        "\U0001f9ec Dynamic Schema Mode",  # 🧬
+        value=False,
+        help=(
+            "When ON, the Lock infers the schema autonomously "
+            "(Two-Pass). When OFF, uses the static IndustrialItem "
+            "schema."
+        ),
+    )
+    if dynamic_mode:
+        st.caption("\U0001f50d Agent will discover fields autonomously.")
+    else:
+        st.caption("\U0001f512 Using static IndustrialItem schema.")
+
 # ────────────────────────────────────────────────────────────────────
 # Main Area — Header
 # ────────────────────────────────────────────────────────────────────
@@ -186,9 +202,11 @@ if extract_clicked and all_systems_go and lock is not None:
 
     try:
         progress.progress(15, text="\U0001f575\ufe0f Scout: Navigating...")
+
+        chosen_schema = None if dynamic_mode else IndustrialItem
         flight_record, data = pipeline.run_sync(
             url=url.strip(),
-            schema=IndustrialItem,
+            schema=chosen_schema,
             context_text=context.strip(),
         )
         progress.progress(100, text="\u2705 Extraction complete!")
@@ -197,11 +215,20 @@ if extract_clicked and all_systems_go and lock is not None:
         st.session_state["flight_record"] = flight_record
         st.session_state["image_bytes"] = flight_record.scout.image_bytes
         st.session_state["data"] = data
-        st.session_state["original_items"] = [
-            item.model_dump() for item in data.items
-        ]
-        st.session_state["source_title"] = data.source_title
-        st.session_state["extraction_notes"] = data.extraction_notes
+        st.session_state["dynamic_mode"] = dynamic_mode
+
+        # Static mode: data has .items / .source_title
+        # Dynamic mode: data is flat Pydantic model
+        if not dynamic_mode and hasattr(data, "items"):
+            st.session_state["original_items"] = [
+                item.model_dump() for item in data.items
+            ]
+            st.session_state["source_title"] = data.source_title
+            st.session_state["extraction_notes"] = data.extraction_notes
+        else:
+            st.session_state["original_items"] = [data.model_dump()]
+            st.session_state["source_title"] = None
+            st.session_state["extraction_notes"] = None
 
     except Exception as exc:
         progress.empty()
@@ -264,9 +291,31 @@ if st.session_state.get("original_items"):
             col_d.metric("Model", fr.lock.model_name.split("/")[-1])
             col_e.metric("Tokens Used", fr.lock.tokens_used or "~")
             col_f.metric("Latency", f"{fr.lock.latency_ms:.0f} ms")
+
+            extraction_mode = (
+                "Two-Pass (Dynamic)" if fr.lock.inferred_schema
+                else "Static Schema"
+            )
             st.caption(
+                f"Mode: **{extraction_mode}** · "
                 f"Max validation retries: {fr.lock.validation_retries}"
             )
+
+            # Inferred Schema Expander (dynamic mode only)
+            if fr.lock.inferred_schema:
+                with st.expander(
+                    "\U0001f9ec Inferred Schema", expanded=True  # 🧬
+                ):
+                    schema_info = fr.lock.inferred_schema
+                    st.markdown(
+                        f"**Entity:** `{schema_info.get('entity_name', '?')}`"
+                    )
+                    for field in schema_info.get("fields", []):
+                        st.markdown(
+                            f"- `{field['name']}` : "
+                            f"**{field['type']}** — "
+                            f"{field.get('description', '')}"
+                        )
 
     # ── Tab 3: Self-Healing ───────────────────────────────────
     with tab_healing:
